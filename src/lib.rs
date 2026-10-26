@@ -105,12 +105,13 @@ fn line_node(id: &str, line: &str, line_no: u32) -> SemanticNode {
                 if let Some((_, rhs)) = line.split_once('=') {
                     let rhs = rhs.trim().trim_end_matches(';').trim();
                     if !rhs.is_empty() {
+                        let rhs_col = line.find(rhs).unwrap_or(0) as u32;
                         children.push(node(
                             &format!("{id}.rhs"),
                             "value_body",
                             rhs,
                             line_no,
-                            0,
+                            rhs_col,
                             &[],
                         ));
                     }
@@ -279,6 +280,26 @@ export!(ReasonmlParser);
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn value_body_uses_actual_source_columns() {
+        let before = "let title = \"old\";\\n";
+        let after = "let title = \"new\";\\n";
+
+        let before_json: serde_json::Value = serde_json::from_str(&parse_reasonml(before)).expect("before JSON");
+        let after_json: serde_json::Value = serde_json::from_str(&parse_reasonml(after)).expect("after JSON");
+
+        let before_rhs = &before_json["children"][0]["children"][0];
+        let after_rhs = &after_json["children"][0]["children"][0];
+
+        assert_eq!(before_rhs["node_type"], "value_body");
+        assert_eq!(before_rhs["position"]["start_col"], 12);
+        assert_eq!(after_rhs["position"]["start_col"], 12);
+        assert!(
+            before_rhs["position"]["end_col"].as_u64().unwrap()
+                > before_rhs["position"]["start_col"].as_u64().unwrap()
+        );
+    }
+
     use super::*;
 
     fn labels_by_type(node: &SemanticNode, node_type: &str, labels: &mut Vec<String>) {
