@@ -60,7 +60,8 @@ fn parse_reasonml(source: &str) -> String {
             continue;
         }
         let id = format!("0.{}", children.len());
-        children.push(line_node(&id, line.trim_end_matches(';').trim(), line_no));
+        let source_col = (raw.len() - raw.trim_start().len()) as u32;
+        children.push(line_node(&id, line.trim_end_matches(';').trim(), line_no, source_col));
     }
 
     let root = SemanticNodeBuilder::new(
@@ -86,7 +87,7 @@ fn strip_line_comment(line: &str) -> &str {
     line.split_once("/*").map_or(line, |(before, _)| before)
 }
 
-fn line_node(id: &str, line: &str, line_no: u32) -> SemanticNode {
+fn line_node(id: &str, line: &str, line_no: u32, source_col: u32) -> SemanticNode {
     for parser in [
         parse_module,
         parse_open,
@@ -105,7 +106,7 @@ fn line_node(id: &str, line: &str, line_no: u32) -> SemanticNode {
                 if let Some((_, rhs)) = line.split_once('=') {
                     let rhs = rhs.trim().trim_end_matches(';').trim();
                     if !rhs.is_empty() {
-                        let rhs_col = line.find(rhs).unwrap_or(0) as u32;
+                        let rhs_col = source_col + line.find(rhs).unwrap_or(0) as u32;
                         children.push(node(
                             &format!("{id}.rhs"),
                             "value_body",
@@ -117,10 +118,13 @@ fn line_node(id: &str, line: &str, line_no: u32) -> SemanticNode {
                     }
                 }
             }
-            return node(id, node_type, &label, line_no, 0, &children);
+            // Semantic identifiers start after declaration keywords, not at
+            // column zero. Offsets are UTF-8 source bytes, including indentation.
+            let label_col = source_col + line.find(label.as_str()).unwrap_or(0) as u32;
+            return node(id, node_type, &label, line_no, label_col, &children);
         }
     }
-    node(id, "reasonml_statement", line, line_no, 0, &[])
+    node(id, "reasonml_statement", line, line_no, source_col, &[])
 }
 
 type ParsedLine = Option<(&'static str, String, Vec<SemanticNode>)>;
@@ -385,4 +389,24 @@ exception MissingAccount;
         assert!(externals.contains(&"digest".to_string()));
         assert!(exceptions.contains(&"MissingAccount".to_string()));
     }
+
+    #[test]
+    fn value_labels_use_identifier_byte_columns_after_indentation() {
+        // Previously the labelled value span covered "  let apply_dis..."
+        // instead of the identifier. Its end column was truncated too.
+        let source = "  let applyDiscount = 42;\n  let formatReceipt = 3;\n";
+        let parsed: serde_json::Value =
+            serde_json::from_str(&parse_reasonml(source)).unwrap();
+        let bindings = parsed["children"].as_array().unwrap();
+        assert_eq!(bindings.len(), 2);
+        for (binding, label) in bindings.iter().zip(["applyDiscount", "formatReceipt"]) {
+            assert_eq!(binding["label"], label);
+            assert_eq!(binding["position"]["start_col"].as_u64(), Some(6));
+            assert_eq!(
+                binding["position"]["end_col"].as_u64(),
+                Some(6 + label.len() as u64)
+            );
+        }
+    }
+
 }
