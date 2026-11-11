@@ -49,20 +49,9 @@ fn detect_language_impl(filename: &str, _content: &str) -> String {
 }
 
 fn parse_reasonml(source: &str) -> String {
-    let mut children = Vec::new();
-    let mut total_lines = 0u32;
-
-    for (index, raw) in source.lines().enumerate() {
-        let line_no = index as u32;
-        total_lines = line_no;
-        let line = strip_line_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        let id = format!("0.{}", children.len());
-        let source_col = (raw.len() - raw.trim_start().len()) as u32;
-        children.push(line_node(&id, line.trim_end_matches(';').trim(), line_no, source_col));
-    }
+    let tokens = tokenize(source);
+    let children = project_items(&tokens, "0");
+    let total_lines = source.lines().count().saturating_sub(1) as u32;
 
     let root = SemanticNodeBuilder::new(
         "0",
@@ -83,142 +72,429 @@ fn parse_reasonml(source: &str) -> String {
     }
 }
 
-fn strip_line_comment(line: &str) -> &str {
-    line.split_once("/*").map_or(line, |(before, _)| before)
+/// Lexical class of a ReasonML token. Comments and whitespace never become tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenKind {
+    /// Identifiers, keywords, numbers, type variables, string and char literals.
+    Word,
+    /// Runs of operator characters (`+`, `=>`, `|`, `::`, `++`, ...).
+    Op,
+    /// `,`, `;`, `.` and any other single punctuation character.
+    Punct,
+    Open,
+    Close,
 }
 
-fn line_node(id: &str, line: &str, line_no: u32, source_col: u32) -> SemanticNode {
-    for parser in [
-        parse_module,
-        parse_open,
-        parse_include,
-        parse_type,
-        parse_let,
-        parse_external,
-        parse_exception,
-    ] {
-        if let Some((node_type, label, children)) = parser(line) {
-            let mut children = children;
-            // #46: a let-binding's RHS is review content — carry it as a child so value
-            // edits (numeric bumps, string edits) surface instead of hashing name-only
-            // (the ocaml sibling got the same fix).
-            if matches!(node_type, "value" | "recursive_value") && children.is_empty() {
-                if let Some((_, rhs)) = line.split_once('=') {
-                    let rhs = rhs.trim().trim_end_matches(';').trim();
-                    if !rhs.is_empty() {
-                        let rhs_col = source_col + line.find(rhs).unwrap_or(0) as u32;
-                        children.push(node(
-                            &format!("{id}.rhs"),
-                            "value_body",
-                            rhs,
-                            line_no,
-                            rhs_col,
-                            &[],
-                        ));
-                    }
-                }
+/// One source token. `text` is the exact source spelling (string literals keep
+/// their inner bytes verbatim); positions are 0-based rows and UTF-8 byte columns.
+#[derive(Clone, Debug)]
+struct Token<'a> {
+    kind: TokenKind,
+    text: &'a str,
+    line: u32,
+    col: u32,
+    end_line: u32,
+    end_col: u32,
+}
+
+const OP_CHARS: &str = "!$%&*+-/:<=>?@^|~#";
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '\'' || !ch.is_ascii()
+}
+
+/// Lexical scanner that understands ReasonML comments (`/* */`, nested, and `//`),
+/// string literals (`"..."` with escapes and `{id|...|id}` quoted strings) and char
+/// literals, so comment markers inside literals are content, never comments.
+fn tokenize(source: &str) -> Vec<Token<'_>> {
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::new();
+    let mut pos = 0usize;
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+
+    // Advance over `source[from..to]`, updating the line bookkeeping.
+    fn advance(source: &str, from: usize, to: usize, line: &mut u32, line_start: &mut usize) {
+        for (offset, byte) in source.as_bytes()[from..to].iter().enumerate() {
+            if *byte == b'\n' {
+                *line += 1;
+                *line_start = from + offset + 1;
             }
-            // Semantic identifiers start after declaration keywords, not at
-            // column zero. Offsets are UTF-8 source bytes, including indentation.
-            let label_col = source_col + line.find(label.as_str()).unwrap_or(0) as u32;
-            return node(id, node_type, &label, line_no, label_col, &children);
         }
     }
-    node(id, "reasonml_statement", line, line_no, source_col, &[])
+
+    while pos < bytes.len() {
+        let rest = &source[pos..];
+        let ch = match rest.chars().next() {
+            Some(ch) => ch,
+            None => break,
+        };
+        let start_line = line;
+        let start_col = (pos - line_start) as u32;
+
+        if ch.is_whitespace() {
+            let next = pos + ch.len_utf8();
+            advance(source, pos, next, &mut line, &mut line_start);
+            pos = next;
+            continue;
+        }
+        if rest.starts_with("/*") {
+            let end = block_comment_end(source, pos);
+            advance(source, pos, end, &mut line, &mut line_start);
+            pos = end;
+            continue;
+        }
+        if rest.starts_with("//") {
+            pos += rest.find('\n').unwrap_or(rest.len());
+            continue;
+        }
+
+        let (kind, end) = if ch == '"' {
+            (TokenKind::Word, string_end(source, pos))
+        } else if let Some(end) = quoted_string_end(source, pos) {
+            (TokenKind::Word, end)
+        } else if let Some(end) = char_literal_end(source, pos) {
+            (TokenKind::Word, end)
+        } else if is_word_char(ch) {
+            let starts_numeric = ch.is_ascii_digit();
+            let len = rest
+                .char_indices()
+                .take_while(|(_, c)| is_word_char(*c) || (starts_numeric && *c == '.'))
+                .map(|(idx, c)| idx + c.len_utf8())
+                .last()
+                .unwrap_or(ch.len_utf8());
+            (TokenKind::Word, pos + len)
+        } else if matches!(ch, '(' | '[' | '{') {
+            (TokenKind::Open, pos + 1)
+        } else if matches!(ch, ')' | ']' | '}') {
+            (TokenKind::Close, pos + 1)
+        } else if OP_CHARS.contains(ch) {
+            let mut end = pos;
+            while end < bytes.len() {
+                let tail = &source[end..];
+                if end > pos && (tail.starts_with("/*") || tail.starts_with("//")) {
+                    break;
+                }
+                match tail.chars().next() {
+                    Some(c) if OP_CHARS.contains(c) => end += c.len_utf8(),
+                    _ => break,
+                }
+            }
+            (TokenKind::Op, end)
+        } else {
+            (TokenKind::Punct, pos + ch.len_utf8())
+        };
+
+        advance(source, pos, end, &mut line, &mut line_start);
+        let end_col = (end - line_start) as u32;
+        tokens.push(Token {
+            kind,
+            text: &source[pos..end],
+            line: start_line,
+            col: start_col,
+            end_line: line,
+            end_col,
+        });
+        pos = end;
+    }
+    tokens
 }
 
-type ParsedLine = Option<(&'static str, String, Vec<SemanticNode>)>;
+/// End (exclusive) of a possibly nested `/* ... */` comment; EOF if unterminated.
+fn block_comment_end(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut pos = start;
+    while pos < bytes.len() {
+        if bytes[pos..].starts_with(b"/*") {
+            depth += 1;
+            pos += 2;
+        } else if bytes[pos..].starts_with(b"*/") {
+            depth -= 1;
+            pos += 2;
+            if depth == 0 {
+                return pos;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    bytes.len()
+}
 
-fn parse_module(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("module ")?;
-    let name = take_identifier(rest)?;
-    let node_type = if rest[name.len()..].trim_start().starts_with(':') {
-        "module_signature"
-    } else {
-        "module"
+/// End (exclusive) of a `"..."` string starting at `start`; EOF if unterminated.
+fn string_end(source: &str, start: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'\\' => pos += 2,
+            b'"' => return pos + 1,
+            _ => pos += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// `{|...|}` / `{js|...|js}` quoted strings.
+fn quoted_string_end(source: &str, start: usize) -> Option<usize> {
+    let rest = source[start..].strip_prefix('{')?;
+    let id_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_lowercase() || *b == b'_')
+        .count();
+    if rest.as_bytes().get(id_len) != Some(&b'|') {
+        return None;
+    }
+    let body_start = start + 1 + id_len + 1;
+    let closing = format!("|{}}}", &rest[..id_len]);
+    Some(
+        source[body_start..]
+            .find(&closing)
+            .map_or(source.len(), |idx| body_start + idx + closing.len()),
+    )
+}
+
+/// `'x'`, `'\n'`, `'\''`, `'\065'`; a lone `'a` is a type variable, not a literal.
+fn char_literal_end(source: &str, start: usize) -> Option<usize> {
+    let rest = source[start..].strip_prefix('\'')?;
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    if first == '\\' {
+        let escaped = rest[1..].chars().next()?;
+        let from = 1 + escaped.len_utf8();
+        let close = rest[from..].find('\'')?;
+        if close > 3 {
+            return None;
+        }
+        return Some(start + 1 + from + close + 1);
+    }
+    if first == '\'' {
+        return None;
+    }
+    let after = first.len_utf8();
+    (rest[after..].starts_with('\'')).then_some(start + 1 + after + 1)
+}
+
+/// Canonical spelling of a token run: insignificant layout is dropped and a single
+/// space is placed only where readability or token separation needs it, so
+/// `1+2` and `1 + 2` project to the same semantic label.
+fn render(tokens: &[Token<'_>]) -> String {
+    let mut out = String::new();
+    let mut prev: Option<&Token<'_>> = None;
+    for token in tokens {
+        if let Some(prev) = prev {
+            let space = match (prev.kind, token.kind) {
+                (TokenKind::Op, _) | (_, TokenKind::Op) => true,
+                (TokenKind::Word | TokenKind::Close, TokenKind::Word) => true,
+                (TokenKind::Punct, _) => matches!(prev.text, "," | ";"),
+                _ => false,
+            };
+            if space {
+                out.push(' ');
+            }
+        }
+        out.push_str(token.text);
+        prev = Some(token);
+    }
+    out
+}
+
+/// Split a token run into `;`-terminated items at bracket depth zero.
+fn split_items<'t, 'a>(tokens: &'t [Token<'a>]) -> Vec<&'t [Token<'a>]> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, token) in tokens.iter().enumerate() {
+        match token.kind {
+            TokenKind::Open => depth += 1,
+            TokenKind::Close => depth = depth.saturating_sub(1),
+            TokenKind::Punct if depth == 0 && token.text == ";" => {
+                if idx > start {
+                    items.push(&tokens[start..idx]);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < tokens.len() {
+        items.push(&tokens[start..]);
+    }
+    items
+}
+
+fn project_items(tokens: &[Token<'_>], parent_id: &str) -> Vec<SemanticNode> {
+    split_items(tokens)
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| item_node(&format!("{parent_id}.{index}"), item))
+        .collect()
+}
+
+fn is_identifier(token: &Token<'_>) -> bool {
+    token.kind == TokenKind::Word
+        && token
+            .text
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphabetic() || ch == '_' || ch == '\'')
+}
+
+fn is_word(token: Option<&Token<'_>>, text: &str) -> bool {
+    token.is_some_and(|t| t.kind == TokenKind::Word && t.text == text)
+}
+
+/// Classified declaration: node type, body node type and the index of the name token.
+fn classify(item: &[Token<'_>]) -> Option<(&'static str, &'static str, usize)> {
+    let first = item.first()?;
+    if first.kind != TokenKind::Word {
+        return None;
+    }
+    let (node_type, body_type, name_idx) = match first.text {
+        "module" if is_word(item.get(1), "type") => ("module_type", "module_body", 2),
+        "module" => {
+            let colon = item
+                .get(2)
+                .is_some_and(|t| t.kind == TokenKind::Op && t.text == ":");
+            let node_type = if colon { "module_signature" } else { "module" };
+            (node_type, "module_body", 1)
+        }
+        "open" => ("open", "open_body", 1),
+        "include" => ("include", "include_body", 1),
+        "type" if is_word(item.get(1), "nonrec") => ("type", "type_body", 2),
+        "type" => ("type", "type_body", 1),
+        "let" if is_word(item.get(1), "rec") => ("recursive_value", "value_body", 2),
+        "let" => {
+            let upper = item
+                .get(1)
+                .and_then(|t| t.text.chars().next())
+                .is_some_and(char::is_uppercase);
+            let node_type = if upper { "component" } else { "value" };
+            (node_type, "value_body", 1)
+        }
+        "external" => ("external", "external_signature", 1),
+        "exception" => ("exception", "exception_body", 1),
+        _ => return None,
     };
-    Some((node_type, name.to_string(), Vec::new()))
+    is_identifier(item.get(name_idx)?).then_some((node_type, body_type, name_idx))
 }
 
-fn parse_open(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("open ")?;
-    let name = take_identifier(rest)?;
-    Some(("open", name.to_string(), Vec::new()))
-}
-
-fn parse_include(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("include ")?;
-    let name = take_identifier(rest)?;
-    Some(("include", name.to_string(), Vec::new()))
-}
-
-fn parse_type(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("type ")?;
-    let name = take_identifier(rest.trim_start_matches("nonrec ").trim_start())?;
-    Some((
-        "type",
-        name.trim_start_matches('\'').to_string(),
-        Vec::new(),
-    ))
-}
-
-fn parse_let(line: &str) -> ParsedLine {
-    let rest = line
-        .strip_prefix("let rec ")
-        .or_else(|| line.strip_prefix("let "))?;
-    let name = take_identifier(rest)?;
-    let node_type = if line.starts_with("let rec ") {
-        "recursive_value"
-    } else if name.chars().next().is_some_and(|ch| ch.is_uppercase()) {
-        "component"
-    } else {
-        "value"
+fn item_node(id: &str, item: &[Token<'_>]) -> SemanticNode {
+    let Some((node_type, body_type, name_idx)) = classify(item) else {
+        return span_node(id, "reasonml_statement", &render(item), item, Vec::new());
     };
-    Some((node_type, name.to_string(), Vec::new()))
+
+    // Module paths (`open Belt.Array`) are part of the declared name.
+    let mut name_end = name_idx + 1;
+    if matches!(node_type, "open" | "include" | "module") {
+        while name_end + 1 < item.len()
+            && item[name_end].kind == TokenKind::Punct
+            && item[name_end].text == "."
+            && item[name_end + 1].kind == TokenKind::Word
+        {
+            name_end += 2;
+        }
+    }
+    let name_tokens = &item[name_idx..name_end];
+    let label = render(name_tokens).trim_start_matches('\'').to_string();
+
+    // Everything after the name is semantic payload: parameters, signatures,
+    // aliases, constructors and right-hand sides. Only the defining `=` is dropped.
+    let mut rest = &item[name_end..];
+    if rest
+        .first()
+        .is_some_and(|t| t.kind == TokenKind::Op && t.text == "=")
+    {
+        rest = &rest[1..];
+    }
+    let mut children = Vec::new();
+    if !rest.is_empty() {
+        let body_id = if body_type == "value_body" {
+            format!("{id}.rhs")
+        } else {
+            format!("{id}.body")
+        };
+        children.push(body_node(&body_id, body_type, rest));
+    }
+
+    let name_span = (
+        name_tokens[0].line,
+        name_tokens[0].col,
+        name_tokens[name_tokens.len() - 1].end_line,
+        name_tokens[name_tokens.len() - 1].end_col,
+    );
+    build_node(id, node_type, &label, name_span, children)
 }
 
-fn parse_external(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("external ")?;
-    let name = take_identifier(rest)?;
-    Some(("external", name.to_string(), Vec::new()))
+/// A body ending in a `{ ... }` block keeps its header as the label and projects the
+/// block's items as children, so edits inside modules and functions stay granular.
+fn body_node(id: &str, body_type: &str, tokens: &[Token<'_>]) -> SemanticNode {
+    if let Some(open_idx) = trailing_block_start(tokens) {
+        let inner = &tokens[open_idx + 1..tokens.len() - 1];
+        let header = &tokens[..open_idx];
+        let label = if header.is_empty() {
+            "{}".to_string()
+        } else {
+            format!("{} {{}}", render(header))
+        };
+        let children = project_items(inner, id);
+        return span_node(id, body_type, &label, tokens, children);
+    }
+    span_node(id, body_type, &render(tokens), tokens, Vec::new())
 }
 
-fn parse_exception(line: &str) -> ParsedLine {
-    let rest = line.strip_prefix("exception ")?;
-    let name = take_identifier(rest)?;
-    Some(("exception", name.to_string(), Vec::new()))
+fn trailing_block_start(tokens: &[Token<'_>]) -> Option<usize> {
+    let last = tokens.last()?;
+    if last.kind != TokenKind::Close || last.text != "}" {
+        return None;
+    }
+    let mut depth = 0usize;
+    for idx in (0..tokens.len()).rev() {
+        match tokens[idx].kind {
+            TokenKind::Close => depth += 1,
+            TokenKind::Open => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    // `{|`-style records are not blocks; only a real `{` qualifies.
+                    return (tokens[idx].text == "{").then_some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
-fn take_identifier(input: &str) -> Option<&str> {
-    let trimmed = input.trim_start();
-    let end = trimmed
-        .char_indices()
-        .take_while(|(_, ch)| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\'' | '.'))
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .last()?;
-    Some(&trimmed[..end])
-}
-
-fn node(
+fn span_node(
     id: &str,
     node_type: &str,
     label: &str,
-    line: u32,
-    col: u32,
-    children: &[SemanticNode],
+    tokens: &[Token<'_>],
+    children: Vec<SemanticNode>,
 ) -> SemanticNode {
-    SemanticNodeBuilder::new(
+    let first = &tokens[0];
+    let last = &tokens[tokens.len() - 1];
+    build_node(
         id,
         node_type,
         label,
-        line,
-        col,
-        line,
-        col + label.len() as u32,
-        stable_hash(node_type, label, children),
+        (first.line, first.col, last.end_line, last.end_col),
+        children,
     )
-    .children(children.to_vec())
-    .build()
+}
+
+fn build_node(
+    id: &str,
+    node_type: &str,
+    label: &str,
+    span: (u32, u32, u32, u32),
+    children: Vec<SemanticNode>,
+) -> SemanticNode {
+    let hash = stable_hash(node_type, label, &children);
+    SemanticNodeBuilder::new(id, node_type, label, span.0, span.1, span.2, span.3, hash)
+        .children(children)
+        .build()
 }
 
 fn stable_hash(node_type: &str, label: &str, children: &[SemanticNode]) -> String {
@@ -289,8 +565,10 @@ mod tests {
         let before = "let title = \"old\";\\n";
         let after = "let title = \"new\";\\n";
 
-        let before_json: serde_json::Value = serde_json::from_str(&parse_reasonml(before)).expect("before JSON");
-        let after_json: serde_json::Value = serde_json::from_str(&parse_reasonml(after)).expect("after JSON");
+        let before_json: serde_json::Value =
+            serde_json::from_str(&parse_reasonml(before)).expect("before JSON");
+        let after_json: serde_json::Value =
+            serde_json::from_str(&parse_reasonml(after)).expect("after JSON");
 
         let before_rhs = &before_json["children"][0]["children"][0];
         let after_rhs = &after_json["children"][0]["children"][0];
@@ -345,7 +623,11 @@ mod tests {
     fn process_returns_valid_json() {
         let parsed = parse_reasonml(DEFAULT_NEW);
         intentumdiff_plugin_sdk::testing::assert_valid_json(&parsed, LANGUAGE_ID);
-        intentumdiff_plugin_sdk::testing::assert_root_node_type(&parsed, ROOT_NODE_TYPE, LANGUAGE_ID);
+        intentumdiff_plugin_sdk::testing::assert_root_node_type(
+            &parsed,
+            ROOT_NODE_TYPE,
+            LANGUAGE_ID,
+        );
     }
 
     #[test]
@@ -395,8 +677,7 @@ exception MissingAccount;
         // Previously the labelled value span covered "  let apply_dis..."
         // instead of the identifier. Its end column was truncated too.
         let source = "  let applyDiscount = 42;\n  let formatReceipt = 3;\n";
-        let parsed: serde_json::Value =
-            serde_json::from_str(&parse_reasonml(source)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&parse_reasonml(source)).unwrap();
         let bindings = parsed["children"].as_array().unwrap();
         assert_eq!(bindings.len(), 2);
         for (binding, label) in bindings.iter().zip(["applyDiscount", "formatReceipt"]) {
@@ -409,4 +690,138 @@ exception MissingAccount;
         }
     }
 
+    fn tree(source: &str) -> SemanticNode {
+        serde_json::from_str(&parse_reasonml(source)).expect("valid tree JSON")
+    }
+
+    fn assert_changed(old: &str, new: &str) {
+        assert_ne!(
+            tree(old).structural_hash,
+            tree(new).structural_hash,
+            "expected a semantic change between {old:?} and {new:?}"
+        );
+    }
+
+    fn assert_preserved(old: &str, new: &str) {
+        assert_eq!(
+            tree(old).structural_hash,
+            tree(new).structural_hash,
+            "expected preservation between {old:?} and {new:?}"
+        );
+    }
+
+    // Issue #7: declaration bodies were dropped, so these were certified as style.
+    #[test]
+    fn type_body_change_is_semantic() {
+        assert_changed("type t = int;\n", "type t = string;\n");
+        assert_changed("type answer = Yes;\n", "type answer = Yes | No;\n");
+        assert_changed(
+            "type answer =\n  | Yes;\n",
+            "type answer =\n  | Yes\n  | No;\n",
+        );
+        let root = tree("type answer = Yes | No;\n");
+        let decl = &root.children[0];
+        assert_eq!(decl.node_type, "type");
+        assert_eq!(decl.label, "answer");
+        let body = &decl.children[0];
+        assert_eq!(body.node_type, "type_body");
+        assert_eq!(body.label, "Yes | No");
+        assert_eq!(body.position.start_line, 0);
+        assert_eq!(body.position.start_col, 14);
+        assert_eq!(body.position.end_col, 22);
+    }
+
+    #[test]
+    fn module_alias_and_signature_changes_are_semantic() {
+        assert_changed("module M = A;\n", "module M = B;\n");
+        assert_changed("module M: S = A;\n", "module M: T = A;\n");
+        assert_changed(
+            "external f: int => int = \"f\";\n",
+            "external f: int => string = \"f\";\n",
+        );
+        assert_changed("exception E(int);\n", "exception E(string);\n");
+        let root = tree("module M = B;\n");
+        assert_eq!(root.children[0].label, "M");
+        assert_eq!(root.children[0].children[0].node_type, "module_body");
+        assert_eq!(root.children[0].children[0].label, "B");
+    }
+
+    #[test]
+    fn multiline_module_body_items_are_children() {
+        let old = "module M = {\n  let a = 1;\n  let b = 2;\n};\n";
+        let new = "module M = {\n  let a = 1;\n  let b = 3;\n};\n";
+        assert_changed(old, new);
+        let root = tree(new);
+        let body = &root.children[0].children[0];
+        assert_eq!(body.children.len(), 2);
+        assert_eq!(body.children[1].label, "b");
+        assert_eq!(body.children[1].position.start_line, 2);
+        assert_eq!(body.children[1].position.start_col, 6);
+        assert_eq!(body.children[1].children[0].label, "3");
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_are_content() {
+        assert_changed("let x = \"/*safe\";\n", "let x = \"/*danger\";\n");
+        assert_changed("let x = \"// a\";\n", "let x = \"// b\";\n");
+        assert_changed("let x = {|/* a|};\n", "let x = {|/* b|};\n");
+        assert_changed("let c = '/';\nlet x = 1;\n", "let c = '/';\nlet x = 2;\n");
+        let root = tree("let x = \"/*safe\";\n");
+        assert_eq!(root.children[0].children[0].label, "\"/*safe\"");
+    }
+
+    #[test]
+    fn real_comments_are_still_ignored() {
+        let base = "let answer = () => 1;\nprint_int(answer());\n";
+        assert_preserved(
+            base,
+            "/* baseline comment */\nlet answer = () => 1;\nprint_int(answer());\n",
+        );
+        assert_preserved(
+            base,
+            "let answer = () => /* inline */ 1;\nprint_int(answer()); // trailing\n",
+        );
+        assert_preserved(
+            base,
+            "/* outer /* nested */ still */\nlet answer = () => 1;\nprint_int(answer());\n",
+        );
+        assert_preserved(base, base);
+    }
+
+    // Issue #8: raw RHS spelling made `1+2` and `1 + 2` differ.
+    #[test]
+    fn let_rhs_spacing_is_preservation() {
+        let old = "let x=1+2;\nprint_int(x);\n";
+        let new = "let x = 1 + 2;\nprint_int(x);\n";
+        assert_preserved(old, new);
+        assert_preserved(old, "let x =\n  1\n  + 2;\nprint_int( x );\n");
+        let root = tree(old);
+        let rhs = &root.children[0].children[0];
+        assert_eq!(rhs.label, "1 + 2");
+        // Spans stay exact source spans: `1+2` at bytes 6..9 of row 0.
+        assert_eq!(rhs.position.start_col, 6);
+        assert_eq!(rhs.position.end_col, 9);
+        // Numeric and operator mutations remain meaningful.
+        assert_changed(old, "let x = 1 + 3;\nprint_int(x);\n");
+        assert_changed(old, "let x = 1 - 2;\nprint_int(x);\n");
+        assert_changed("print_int(6 + 2);\n", "print_int(6 - 2);\n");
+        // Spacing inside string literals is content.
+        assert_changed("let s = \"a b\";\n", "let s = \"a  b\";\n");
+    }
+
+    #[test]
+    fn unterminated_input_is_bounded() {
+        for source in [
+            "let answer = (\n",
+            "let s = \"open\n",
+            "/* open\nlet x = 1;\n",
+            "let c = '",
+            "}}};;",
+        ] {
+            intentumdiff_plugin_sdk::testing::assert_valid_json(
+                &parse_reasonml(source),
+                LANGUAGE_ID,
+            );
+        }
+    }
 }
