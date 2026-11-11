@@ -17,6 +17,18 @@ const DEFAULT_OLD: &str = "let title = \"old\";\n";
 const DEFAULT_NEW: &str = "let title = \"new\";\n";
 const PLUGIN_METADATA: &str = include_str!("../plugin_metadata.info");
 
+/// Maximum number of nested `{ ... }` declaration blocks projected as child items.
+///
+/// Block projection recurses (`project_items` -> `item_node` -> `body_node`), and
+/// tree serialisation and drop recurse once per tree level too, so the nesting
+/// depth must never be input-controlled. Each projected block adds four JSON
+/// nesting levels (item object, its children array, body object, its children
+/// array); 24 blocks keeps the emitted tree well under serde_json's default
+/// 128-level deserialisation limit that hosts apply. A block nested deeper than
+/// this is kept as a single body leaf whose label is the canonical rendering of
+/// its whole token run, so its source facts still reach the label and hash.
+const MAX_BLOCK_DEPTH: usize = 24;
+
 struct ReasonmlParser;
 
 fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
@@ -50,7 +62,7 @@ fn detect_language_impl(filename: &str, _content: &str) -> String {
 
 fn parse_reasonml(source: &str) -> String {
     let tokens = tokenize(source);
-    let children = project_items(&tokens, "0");
+    let children = project_items(&tokens, "0", 0);
     let total_lines = source.lines().count().saturating_sub(1) as u32;
 
     let root = SemanticNodeBuilder::new(
@@ -324,11 +336,12 @@ fn split_items<'t, 'a>(tokens: &'t [Token<'a>]) -> Vec<&'t [Token<'a>]> {
     items
 }
 
-fn project_items(tokens: &[Token<'_>], parent_id: &str) -> Vec<SemanticNode> {
+/// Project `tokens` as items of a block nested `depth` levels deep (0 = file).
+fn project_items(tokens: &[Token<'_>], parent_id: &str, depth: usize) -> Vec<SemanticNode> {
     split_items(tokens)
         .into_iter()
         .enumerate()
-        .map(|(index, item)| item_node(&format!("{parent_id}.{index}"), item))
+        .map(|(index, item)| item_node(&format!("{parent_id}.{index}"), item, depth))
         .collect()
 }
 
@@ -380,7 +393,7 @@ fn classify(item: &[Token<'_>]) -> Option<(&'static str, &'static str, usize)> {
     is_identifier(item.get(name_idx)?).then_some((node_type, body_type, name_idx))
 }
 
-fn item_node(id: &str, item: &[Token<'_>]) -> SemanticNode {
+fn item_node(id: &str, item: &[Token<'_>], depth: usize) -> SemanticNode {
     let Some((node_type, body_type, name_idx)) = classify(item) else {
         return span_node(id, "reasonml_statement", &render(item), item, Vec::new());
     };
@@ -415,7 +428,7 @@ fn item_node(id: &str, item: &[Token<'_>]) -> SemanticNode {
         } else {
             format!("{id}.body")
         };
-        children.push(body_node(&body_id, body_type, rest));
+        children.push(body_node(&body_id, body_type, rest, depth));
     }
 
     let name_span = (
@@ -429,7 +442,12 @@ fn item_node(id: &str, item: &[Token<'_>]) -> SemanticNode {
 
 /// A body ending in a `{ ... }` block keeps its header as the label and projects the
 /// block's items as children, so edits inside modules and functions stay granular.
-fn body_node(id: &str, body_type: &str, tokens: &[Token<'_>]) -> SemanticNode {
+/// `depth` is the nesting depth of the item owning this body; once it reaches
+/// [`MAX_BLOCK_DEPTH`] the block is not descended into and the body stays a leaf.
+fn body_node(id: &str, body_type: &str, tokens: &[Token<'_>], depth: usize) -> SemanticNode {
+    if depth >= MAX_BLOCK_DEPTH {
+        return span_node(id, body_type, &render(tokens), tokens, Vec::new());
+    }
     if let Some(open_idx) = trailing_block_start(tokens) {
         let inner = &tokens[open_idx + 1..tokens.len() - 1];
         let header = &tokens[..open_idx];
@@ -438,7 +456,7 @@ fn body_node(id: &str, body_type: &str, tokens: &[Token<'_>]) -> SemanticNode {
         } else {
             format!("{} {{}}", render(header))
         };
-        let children = project_items(inner, id);
+        let children = project_items(inner, id, depth + 1);
         return span_node(id, body_type, &label, tokens, children);
     }
     span_node(id, body_type, &render(tokens), tokens, Vec::new())
@@ -807,6 +825,125 @@ exception MissingAccount;
         assert_changed("print_int(6 + 2);\n", "print_int(6 - 2);\n");
         // Spacing inside string literals is content.
         assert_changed("let s = \"a b\";\n", "let s = \"a  b\";\n");
+    }
+
+    // Issue #10: block projection recursed once per nested block with no limit,
+    // so deeply nested modules/values overflowed the stack and aborted the parser.
+    fn nested_modules(levels: usize, value: &str) -> String {
+        let mut source = String::new();
+        for level in 0..levels {
+            source.push_str(&format!("module M{level} = {{\n"));
+        }
+        source.push_str(&format!("let x = {value};\n"));
+        for _ in 0..levels {
+            source.push_str("};\n");
+        }
+        source
+    }
+
+    fn nested_values(levels: usize, value: &str) -> String {
+        let mut source = String::new();
+        for level in 0..levels {
+            source.push_str(&format!("let v{level} = () => {{ "));
+        }
+        source.push_str(value);
+        for _ in 0..levels {
+            source.push_str(" };");
+        }
+        source.push('\n');
+        source
+    }
+
+    /// JSON nesting depth, computed iteratively so the check itself is bounded.
+    fn json_depth(value: &serde_json::Value) -> usize {
+        let mut max = 0;
+        let mut stack = vec![(value, 1usize)];
+        while let Some((value, depth)) = stack.pop() {
+            max = max.max(depth);
+            match value {
+                serde_json::Value::Object(map) => {
+                    stack.extend(map.values().map(|v| (v, depth + 1)))
+                }
+                serde_json::Value::Array(items) => {
+                    stack.extend(items.iter().map(|v| (v, depth + 1)))
+                }
+                _ => {}
+            }
+        }
+        max
+    }
+
+    /// Parse on a 1 MiB stack, as a constrained host would, and check the result is
+    /// a tree (not an error) that hosts can read with serde_json's default limit.
+    fn parse_on_small_stack(source: String) -> serde_json::Value {
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let parsed = parse_reasonml(&source);
+                intentumdiff_plugin_sdk::testing::assert_valid_json(&parsed, LANGUAGE_ID);
+                let value: serde_json::Value =
+                    serde_json::from_str(&parsed).expect("default-limit JSON parse");
+                assert!(value.get("error").is_none(), "unexpected error envelope");
+                assert!(json_depth(&value) < 128, "tree too deep for hosts");
+                value
+            })
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread must not crash")
+    }
+
+    #[test]
+    fn nested_blocks_at_the_limit_stay_granular() {
+        let source = nested_modules(MAX_BLOCK_DEPTH, "1");
+        let root = parse_on_small_stack(source.clone());
+        let mut node = &root["children"][0];
+        for level in 0..MAX_BLOCK_DEPTH {
+            assert_eq!(node["node_type"], "module");
+            assert_eq!(node["label"], format!("M{level}"));
+            let body = &node["children"][0];
+            assert_eq!(body["node_type"], "module_body");
+            assert_eq!(body["label"], "{}");
+            node = &body["children"][0];
+        }
+        assert_eq!(node["node_type"], "value");
+        assert_eq!(node["label"], "x");
+        assert_eq!(node["children"][0]["label"], "1");
+        assert_changed(&source, &nested_modules(MAX_BLOCK_DEPTH, "2"));
+        assert_preserved(&source, &source.replace("\n", "\n  "));
+    }
+
+    #[test]
+    fn deeply_nested_blocks_are_bounded_on_a_small_stack() {
+        for levels in [MAX_BLOCK_DEPTH + 1, 3_000, 20_000, 100_000] {
+            let root = parse_on_small_stack(nested_modules(levels, "1"));
+            let mut node = &root["children"][0];
+            for _ in 0..MAX_BLOCK_DEPTH {
+                node = &node["children"][0]["children"][0];
+            }
+            assert_eq!(node["label"], format!("M{MAX_BLOCK_DEPTH}"));
+            let leaf = &node["children"][0];
+            assert_eq!(leaf["node_type"], "module_body");
+            assert!(leaf["children"].as_array().is_none_or(|c| c.is_empty()));
+            let label = leaf["label"].as_str().unwrap();
+            assert!(label.starts_with('{') && label.contains("let x = 1;"));
+            // Spans stay exact: the leaf ends on the last `}` of that module.
+            assert_eq!(
+                leaf["position"]["end_line"].as_u64(),
+                Some((2 * levels - MAX_BLOCK_DEPTH) as u64)
+            );
+
+            parse_on_small_stack(nested_values(levels, "1"));
+        }
+        // Facts beyond the projection limit still reach labels and hashes.
+        let levels = 100_000;
+        let (old, new) = (nested_modules(levels, "1"), nested_modules(levels, "2"));
+        let (old_hash, new_hash) = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || (tree(&old).structural_hash, tree(&new).structural_hash))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_ne!(old_hash, new_hash);
     }
 
     #[test]
